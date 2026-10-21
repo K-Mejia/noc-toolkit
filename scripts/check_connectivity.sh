@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # check_connectivity.sh - NOC Toolkit
-# Etapa 2.2: parser CSV + verificaciones ICMP y DNS.
+# Etapa 2.3: parser CSV + verificaciones ICMP, DNS y TCP.
 #
 
 set -u
@@ -14,38 +14,38 @@ readonly EXIT_CONNECTIVITY=1
 readonly EXIT_CONFIG=2
 
 # ---------------------------------------------------------------------------
-# Resultado del parser (disponible para las verificaciones)
+# Parser
 # ---------------------------------------------------------------------------
 PARSED_HOSTS=()
 PARSED_PORTS=()
 
 # ---------------------------------------------------------------------------
-# Configuración de ejecución
+# Configuración
 # ---------------------------------------------------------------------------
 ARG_FILE=""
 TIMEOUT_SECS=2
 
 # ---------------------------------------------------------------------------
-# Resultados por host (arrays paralelos)
+# Resultados (arrays paralelos)
 # ---------------------------------------------------------------------------
 RESULT_ICMP=()
 RESULT_DNS=()
+RESULT_TCP=()
 
 # ---------------------------------------------------------------------------
-# Uso / ayuda
+# Ayuda
 # ---------------------------------------------------------------------------
 usage() {
     cat <<'EOF'
 Uso: check_connectivity.sh --file <archivo.csv> [--timeout <segundos>]
 
 Descripción:
-  Lee un archivo CSV con encabezado "host,port", comprueba resolución DNS
-  (getent ahosts) y conectividad ICMP (ping) de cada host, y muestra un
-  informe.
+  Lee un archivo CSV con encabezado "host,port" y comprueba resolución DNS,
+  conectividad ICMP y conectividad TCP al puerto indicado.
 
 Opciones:
   --file <ruta>        Archivo CSV de entrada (obligatorio).
-  --timeout <segundos> Timeout por comprobación ICMP. Entero positivo.
+  --timeout <segundos> Timeout por comprobación. Entero positivo.
                        Predeterminado: 2.
   -h, --help           Muestra esta ayuda y termina.
 
@@ -55,25 +55,23 @@ Formato del CSV:
   - Líneas vacías permitidas (se ignoran).
   - Solo dos columnas, sin comillas ni comas escapadas.
 
-Comportamiento DNS:
-  - Hosts que son IP literal: DNS = N/A (no se hace DNS inverso).
-  - Hosts con nombre: DNS = OK si getent ahosts devuelve al menos una
-    dirección; FAIL en caso contrario.
-
-Comportamiento ICMP:
-  - IP literal: se hace ping directamente.
-  - Nombre con DNS OK: se hace ping al nombre.
-  - Nombre con DNS FAIL: ICMP = FAIL sin ejecutar ping (dependencia técnica).
+Resultados por columna:
+  ICMP: OK / FAIL
+  DNS:  OK / FAIL / N/A  (N/A si el host es IP literal)
+  TCP:  OK / FAIL / SKIPPED  (SKIPPED si DNS falla para un nombre)
 
 Códigos de salida:
-  0  Configuración válida y todas las comprobaciones aplicables OK.
-  1  Configuración válida, pero alguna comprobación de conectividad falló.
+  0  Todas las verificaciones aplicables OK.
+  1  Algún FAIL o SKIPPED.
   2  Error de uso, de configuración o de entorno.
 
-Limitaciones actuales:
-  - No se verifica TCP (puertos del CSV aún no se usan).
-  - getent ahosts depende de /etc/nsswitch.conf y de la configuración NSS.
-  - ping -W puede no ser interpretado igual por implementaciones no-iputils.
+Dependencias:
+  ping, getent, timeout y bash con soporte /dev/tcp.
+
+Limitaciones:
+  - /dev/tcp no está disponible en Alpine/BusyBox ni en sh POSIX.
+  - TCP solo verifica que el socket se abre; no valida el protocolo.
+  - No se hace DNS inverso.
 EOF
 }
 
@@ -85,7 +83,7 @@ err() {
 }
 
 # ---------------------------------------------------------------------------
-# Validación de argumentos
+# Argumentos
 # ---------------------------------------------------------------------------
 parse_args() {
     ARG_FILE=""
@@ -139,51 +137,50 @@ parse_args() {
         err "Falta la opción obligatoria --file."
         return "$EXIT_CONFIG"
     fi
-
     return "$EXIT_OK"
 }
 
 # ---------------------------------------------------------------------------
-# Disponibilidad de comandos externos
+# Comprueba que /dev/tcp esté soportado por este Bash.
+# ---------------------------------------------------------------------------
+tcp_redirect_supported() {
+    local msg
+    msg=$(bash -c 'exec 3<>/dev/tcp/127.0.0.1/1' 2>&1) || true
+    [[ "$msg" != *"No such file or directory"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# Dependencias
 # ---------------------------------------------------------------------------
 check_dependencies() {
     local cmd
-    for cmd in ping getent timeout; do
+    for cmd in ping getent timeout bash; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             err "Comando requerido no encontrado en PATH: $cmd"
             return "$EXIT_CONFIG"
         fi
     done
+    if ! tcp_redirect_supported; then
+        err "Este Bash no soporta redirecciones /dev/tcp (¿compilado sin --enable-net-redirections?)."
+        return "$EXIT_CONFIG"
+    fi
     return "$EXIT_OK"
 }
 
 # ---------------------------------------------------------------------------
-# Comprueba que el archivo exista y sea legible y no vacío.
+# Archivo legible
 # ---------------------------------------------------------------------------
 check_file_readable() {
     local file="$1"
-
-    if [[ ! -e "$file" ]]; then
-        err "El archivo no existe: $file"
-        return "$EXIT_CONFIG"
-    fi
-    if [[ ! -f "$file" ]]; then
-        err "La ruta no es un archivo regular: $file"
-        return "$EXIT_CONFIG"
-    fi
-    if [[ ! -r "$file" ]]; then
-        err "El archivo no es legible: $file"
-        return "$EXIT_CONFIG"
-    fi
-    if [[ ! -s "$file" ]]; then
-        err "El archivo está vacío: $file"
-        return "$EXIT_CONFIG"
-    fi
+    if [[ ! -e "$file" ]]; then err "El archivo no existe: $file"; return "$EXIT_CONFIG"; fi
+    if [[ ! -f "$file" ]]; then err "La ruta no es un archivo regular: $file"; return "$EXIT_CONFIG"; fi
+    if [[ ! -r "$file" ]]; then err "El archivo no es legible: $file"; return "$EXIT_CONFIG"; fi
+    if [[ ! -s "$file" ]]; then err "El archivo está vacío: $file"; return "$EXIT_CONFIG"; fi
     return "$EXIT_OK"
 }
 
 # ---------------------------------------------------------------------------
-# Validación de puerto (se conserva del parser; aún no se usa en red)
+# Puerto válido
 # ---------------------------------------------------------------------------
 is_valid_port() {
     local port="$1"
@@ -192,13 +189,11 @@ is_valid_port() {
 }
 
 # ---------------------------------------------------------------------------
-# Parser CSV (sin cambios de contrato)
+# Parser CSV
 # ---------------------------------------------------------------------------
 parse_hosts_file() {
     local file="$1"
-    local line line_no=0
-    local header_seen=0
-    local records=0
+    local line line_no=0 header_seen=0 records=0
     local host port extra
 
     PARSED_HOSTS=()
@@ -206,11 +201,7 @@ parse_hosts_file() {
 
     while IFS= read -r line || [[ -n "$line" ]]; do
         line_no=$((line_no + 1))
-
-        if [[ -z "${line//[[:space:]]/}" ]]; then
-            continue
-        fi
-
+        if [[ -z "${line//[[:space:]]/}" ]]; then continue; fi
         line="${line%$'\r'}"
 
         if (( header_seen == 0 )); then
@@ -223,53 +214,32 @@ parse_hosts_file() {
         fi
 
         IFS=',' read -r host port extra <<< "$line"
-
-        if [[ -n "${extra:-}" ]]; then
-            err "Registro con más de dos columnas en línea $line_no."
-            return "$EXIT_CONFIG"
-        fi
-        if [[ "$line" != *,* ]]; then
-            err "Registro malformado en línea $line_no: falta la coma separadora."
-            return "$EXIT_CONFIG"
-        fi
-        if [[ -z "$host" ]]; then
-            err "Host vacío en línea $line_no."
-            return "$EXIT_CONFIG"
-        fi
-        if ! is_valid_port "$port"; then
-            err "Puerto inválido en línea $line_no: '$port' (debe ser entero 1-65535)."
-            return "$EXIT_CONFIG"
-        fi
+        if [[ -n "${extra:-}" ]]; then err "Registro con más de dos columnas en línea $line_no."; return "$EXIT_CONFIG"; fi
+        if [[ "$line" != *,* ]]; then err "Registro malformado en línea $line_no: falta la coma separadora."; return "$EXIT_CONFIG"; fi
+        if [[ -z "$host" ]]; then err "Host vacío en línea $line_no."; return "$EXIT_CONFIG"; fi
+        if ! is_valid_port "$port"; then err "Puerto inválido en línea $line_no: '$port' (debe ser entero 1-65535)."; return "$EXIT_CONFIG"; fi
 
         PARSED_HOSTS+=("$host")
         PARSED_PORTS+=("$port")
         records=$((records + 1))
     done < "$file"
 
-    if (( header_seen == 0 )); then
-        err "El archivo no contiene cabecera 'host,port'."
-        return "$EXIT_CONFIG"
-    fi
-    if (( records == 0 )); then
-        err "El archivo no contiene registros válidos."
-        return "$EXIT_CONFIG"
-    fi
+    if (( header_seen == 0 )); then err "El archivo no contiene cabecera 'host,port'."; return "$EXIT_CONFIG"; fi
+    if (( records == 0 )); then err "El archivo no contiene registros válidos."; return "$EXIT_CONFIG"; fi
     return "$EXIT_OK"
 }
 
 # ---------------------------------------------------------------------------
-# Detección de IP literal (IPv4 o IPv6). No hace consultas de red.
+# IP literal
 # ---------------------------------------------------------------------------
 is_ip_literal() {
     local h="$1"
-    # IPv4
     if [[ "$h" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
         local o1 o2 o3 o4
         IFS='.' read -r o1 o2 o3 o4 <<< "$h"
         (( 10#$o1 <= 255 && 10#$o2 <= 255 && 10#$o3 <= 255 && 10#$o4 <= 255 ))
         return $?
     fi
-    # IPv6 (forma simplificada: contiene ':' y solo hex/':')
     if [[ "$h" == *:* && "$h" =~ ^[0-9A-Fa-f:]+$ ]]; then
         return 0
     fi
@@ -277,37 +247,30 @@ is_ip_literal() {
 }
 
 # ---------------------------------------------------------------------------
-# DNS: OK / FAIL / N/A. Sin salida cruda de getent.
+# DNS
 # ---------------------------------------------------------------------------
+dns_resolves() {
+    getent ahosts "$1" 2>/dev/null | grep -qE '^[0-9]'
+}
+
 check_dns() {
     local host="$1"
-
     if is_ip_literal "$host"; then
         printf 'N/A'
         return
     fi
-
-    if getent ahosts "$host" 2>/dev/null | grep -qE '^[0-9]'; then
-        printf 'OK'
-    else
-        printf 'FAIL'
-    fi
+    if dns_resolves "$host"; then printf 'OK'; else printf 'FAIL'; fi
 }
 
 # ---------------------------------------------------------------------------
-# ICMP: OK / FAIL. Usa ping -W y un timeout externo como salvaguarda.
+# ICMP
 # ---------------------------------------------------------------------------
 check_icmp() {
     local host="$1"
-
-    # Si no es IP y DNS falló, no intentamos ping contra un nombre irresoluble.
-    if ! is_ip_literal "$host"; then
-        if ! getent ahosts "$host" 2>/dev/null | grep -qE '^[0-9]'; then
-            printf 'FAIL'
-            return
-        fi
+    if ! is_ip_literal "$host" && ! dns_resolves "$host"; then
+        printf 'FAIL'
+        return
     fi
-
     if timeout "$TIMEOUT_SECS" ping -W "$TIMEOUT_SECS" -c 1 "$host" >/dev/null 2>&1; then
         printf 'OK'
     else
@@ -316,87 +279,108 @@ check_icmp() {
 }
 
 # ---------------------------------------------------------------------------
-# Ejecuta verificaciones para todos los hosts y llena RESULT_*.
+# TCP
+# ---------------------------------------------------------------------------
+check_tcp() {
+    local host="$1"
+    local port="$2"
+
+    if ! is_ip_literal "$host" && ! dns_resolves "$host"; then
+        printf 'SKIPPED'
+        return
+    fi
+
+    if timeout "$TIMEOUT_SECS" bash -c 'exec 3<>/dev/tcp/"$1"/"$2"' _ "$host" "$port" 2>/dev/null; then
+        printf 'OK'
+    else
+        printf 'FAIL'
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Ejecución
 # ---------------------------------------------------------------------------
 run_checks() {
     local i
     RESULT_ICMP=()
     RESULT_DNS=()
+    RESULT_TCP=()
 
     for i in "${!PARSED_HOSTS[@]}"; do
-        RESULT_DNS+=("$(check_dns "${PARSED_HOSTS[$i]}")")
-        RESULT_ICMP+=("$(check_icmp "${PARSED_HOSTS[$i]}")")
+        local h="${PARSED_HOSTS[$i]}"
+        local p="${PARSED_PORTS[$i]}"
+        RESULT_DNS+=("$(check_dns "$h")")
+        RESULT_ICMP+=("$(check_icmp "$h")")
+        RESULT_TCP+=("$(check_tcp "$h" "$p")")
     done
 }
 
 # ---------------------------------------------------------------------------
-# Presentación
+# Reporte
 # ---------------------------------------------------------------------------
 print_report() {
     local i
     local total=${#PARSED_HOSTS[@]}
     local icmp_ok=0 icmp_fail=0 dns_fail=0
+    local tcp_ok=0 tcp_fail=0 tcp_skipped=0
+    local any_problem=0
 
     for i in "${!PARSED_HOSTS[@]}"; do
         case "${RESULT_ICMP[$i]}" in
             OK) icmp_ok=$((icmp_ok + 1)) ;;
-            FAIL) icmp_fail=$((icmp_fail + 1)) ;;
+            FAIL) icmp_fail=$((icmp_fail + 1)); any_problem=1 ;;
         esac
         case "${RESULT_DNS[$i]}" in
-            FAIL) dns_fail=$((dns_fail + 1)) ;;
+            FAIL) dns_fail=$((dns_fail + 1)); any_problem=1 ;;
+        esac
+        case "${RESULT_TCP[$i]}" in
+            OK) tcp_ok=$((tcp_ok + 1)) ;;
+            FAIL) tcp_fail=$((tcp_fail + 1)); any_problem=1 ;;
+            SKIPPED) tcp_skipped=$((tcp_skipped + 1)); any_problem=1 ;;
         esac
     done
 
-    printf '\n[+] NETWORK CONNECTIVITY REPORT\n\n\n\n'
-    printf '%-18s %-8s %-8s\n' "HOST" "ICMP" "DNS"
-    printf '%s\n' "---------------------------------"
+    printf '\nNETWORK CONNECTIVITY REPORT\n'
+    printf '%s\n' "------------------------------------------------"
+    printf '%-18s %-6s %-7s %-6s %-8s\n' "HOST" "PORT" "ICMP" "DNS" "TCP"
+    printf '%s\n' "------------------------------------------------"
     for i in "${!PARSED_HOSTS[@]}"; do
-        printf '%-18s %-8s %-8s\n' \
-            "${PARSED_HOSTS[$i]}" "${RESULT_ICMP[$i]}" "${RESULT_DNS[$i]}"
+        printf '%-18s %-6s %-7s %-6s %-8s\n' \
+            "${PARSED_HOSTS[$i]}" "${PARSED_PORTS[$i]}" \
+            "${RESULT_ICMP[$i]}" "${RESULT_DNS[$i]}" "${RESULT_TCP[$i]}"
     done
-
-    printf '\nSUMMARY\n'
+    printf '\n%s\n' "SUMMARY"
+    printf '%s\n' "------------------------------------------------"
     printf 'Total hosts: %d\n' "$total"
     printf 'ICMP success: %d\n' "$icmp_ok"
     printf 'ICMP failures: %d\n' "$icmp_fail"
     printf 'DNS failures: %d\n' "$dns_fail"
+    printf 'TCP success: %d\n' "$tcp_ok"
+    printf 'TCP failures: %d\n' "$tcp_fail"
+    printf 'TCP skipped: %d\n' "$tcp_skipped"
 
-    if (( icmp_fail > 0 )); then
+    if (( any_problem == 1 )); then
         return "$EXIT_CONNECTIVITY"
     fi
     return "$EXIT_OK"
 }
 
 # ---------------------------------------------------------------------------
-# Programa principal
+# Main
 # ---------------------------------------------------------------------------
 main() {
     local rc
+    parse_args "$@"; rc=$?
+    if (( rc != 0 )); then usage >&2; return "$rc"; fi
 
-    parse_args "$@"
-    rc=$?
-    if (( rc != 0 )); then
-        usage >&2
-        return "$rc"
-    fi
+    check_dependencies; rc=$?
+    if (( rc != 0 )); then return "$rc"; fi
 
-    check_dependencies
-    rc=$?
-    if (( rc != 0 )); then
-        return "$rc"
-    fi
+    check_file_readable "$ARG_FILE"; rc=$?
+    if (( rc != 0 )); then return "$rc"; fi
 
-    check_file_readable "$ARG_FILE"
-    rc=$?
-    if (( rc != 0 )); then
-        return "$rc"
-    fi
-
-    parse_hosts_file "$ARG_FILE"
-    rc=$?
-    if (( rc != 0 )); then
-        return "$rc"
-    fi
+    parse_hosts_file "$ARG_FILE"; rc=$?
+    if (( rc != 0 )); then return "$rc"; fi
 
     run_checks
     print_report
