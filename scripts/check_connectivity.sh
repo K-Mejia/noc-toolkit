@@ -57,8 +57,8 @@ Formato del CSV:
 
 Resultados por columna:
   ICMP: OK / FAIL
-  DNS:  OK / FAIL / N/A  (N/A si el host es IP literal)
-  TCP:  OK / FAIL / SKIPPED  (SKIPPED si DNS falla para un nombre)
+  DNS:  OK / FAIL / N/A  (N/A si el host es una IP)
+  TCP:  OK / FAIL / SKIPPED  (SKIPPED si DNS falla)
 
 Códigos de salida:
   0  Todas las verificaciones aplicables OK.
