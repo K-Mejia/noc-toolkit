@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Nginx access log analyzer (combined format) — NOC Toolkit.
 
-Etapa DEV-004.2: parser + agregación de errores HTTP 4xx/5xx.
-No hay estadísticas horarias, exportaciones ni gráficos.
+Etapas DEV-004.1 (parser), DEV-004.2 (agregación HTTP) y
+DEV-004.3 (estadísticas horarias). Sin gráficos, exportaciones ni CI.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import re
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
@@ -35,44 +35,24 @@ _PATTERN = re.compile(
 
 _DT_FORMAT = "%d/%b/%Y:%H:%M:%S %z"
 
-# Descripciones de códigos HTTP relevantes al reporte (4xx y 5xx).
-# Los códigos no listados se muestran como "HTTP <code> (unknown reason)".
 _HTTP_REASONS: dict[int, str] = {
-    400: "Bad Request",
-    401: "Unauthorized",
-    403: "Forbidden",
-    404: "Not Found",
-    405: "Method Not Allowed",
-    406: "Not Acceptable",
-    408: "Request Timeout",
-    409: "Conflict",
-    410: "Gone",
-    411: "Length Required",
-    412: "Precondition Failed",
-    413: "Payload Too Large",
-    414: "URI Too Long",
-    415: "Unsupported Media Type",
-    416: "Range Not Satisfiable",
-    417: "Expectation Failed",
-    418: "I'm a teapot",
-    421: "Misdirected Request",
-    422: "Unprocessable Entity",
-    425: "Too Early",
-    426: "Upgrade Required",
-    428: "Precondition Required",
-    429: "Too Many Requests",
+    400: "Bad Request", 401: "Unauthorized", 403: "Forbidden",
+    404: "Not Found", 405: "Method Not Allowed", 406: "Not Acceptable",
+    408: "Request Timeout", 409: "Conflict", 410: "Gone",
+    411: "Length Required", 412: "Precondition Failed",
+    413: "Payload Too Large", 414: "URI Too Long",
+    415: "Unsupported Media Type", 416: "Range Not Satisfiable",
+    417: "Expectation Failed", 418: "I'm a teapot",
+    421: "Misdirected Request", 422: "Unprocessable Entity",
+    425: "Too Early", 426: "Upgrade Required",
+    428: "Precondition Required", 429: "Too Many Requests",
     431: "Request Header Fields Too Large",
     451: "Unavailable For Legal Reasons",
-    500: "Internal Server Error",
-    501: "Not Implemented",
-    502: "Bad Gateway",
-    503: "Service Unavailable",
-    504: "Gateway Timeout",
-    505: "HTTP Version Not Supported",
-    506: "Variant Also Negotiates",
-    507: "Insufficient Storage",
-    508: "Loop Detected",
-    510: "Not Extended",
+    500: "Internal Server Error", 501: "Not Implemented",
+    502: "Bad Gateway", 503: "Service Unavailable",
+    504: "Gateway Timeout", 505: "HTTP Version Not Supported",
+    506: "Variant Also Negotiates", 507: "Insufficient Storage",
+    508: "Loop Detected", 510: "Not Extended",
     511: "Network Authentication Required",
 }
 
@@ -89,9 +69,17 @@ class LogRecord:
 
 
 @dataclass
-class Aggregation:
-    """Contadores agregados de un archivo de log."""
+class HourBucket:
+    client_errors: int = 0
+    server_errors: int = 0
 
+    @property
+    def total(self) -> int:
+        return self.client_errors + self.server_errors
+
+
+@dataclass
+class Aggregation:
     total_lines: int = 0
     valid_records: int = 0
     invalid_records: int = 0
@@ -99,6 +87,8 @@ class Aggregation:
     client_errors: int = 0
     server_errors: int = 0
     error_codes: Counter[int] = field(default_factory=Counter)
+    # Clave: datetime truncado a la hora, conservando el offset del registro.
+    hourly: dict[datetime, HourBucket] = field(default_factory=dict)
 
     @property
     def total_http_errors(self) -> int:
@@ -157,7 +147,6 @@ def iter_file_lines(path: Path) -> Iterator[str]:
 
 
 def classify_status(status: int) -> str:
-    """Devuelve 'non_error', 'client_error' o 'server_error'."""
     if 400 <= status <= 499:
         return "client_error"
     if 500 <= status <= 599:
@@ -165,8 +154,12 @@ def classify_status(status: int) -> str:
     return "non_error"
 
 
+def hour_key(ts: datetime) -> datetime:
+    """Trunca a la hora conservando tzinfo (el offset del registro)."""
+    return ts.replace(minute=0, second=0, microsecond=0)
+
+
 def aggregate(path: Path) -> Aggregation:
-    """Recorre el archivo y construye la agregación sin acumular registros."""
     agg = Aggregation()
     for line in iter_file_lines(path):
         agg.total_lines += 1
@@ -177,22 +170,36 @@ def aggregate(path: Path) -> Aggregation:
 
         agg.valid_records += 1
         category = classify_status(record.status)
+        if category == "non_error":
+            agg.non_error += 1
+            continue
+
+        bucket = agg.hourly.setdefault(hour_key(record.timestamp), HourBucket())
         if category == "client_error":
             agg.client_errors += 1
             agg.error_codes[record.status] += 1
-        elif category == "server_error":
+            bucket.client_errors += 1
+        else:  # server_error
             agg.server_errors += 1
             agg.error_codes[record.status] += 1
-        else:
-            agg.non_error += 1
+            bucket.server_errors += 1
     return agg
 
 
 def format_reason(code: int) -> str:
     reason = _HTTP_REASONS.get(code)
-    if reason is None:
-        return f"HTTP {code} (unknown reason)"
-    return f"{code} {reason}"
+    return f"{code} {reason}" if reason else f"HTTP {code} (unknown reason)"
+
+
+def format_hour_label(dt: datetime) -> str:
+    # dt conserva tzinfo con offset tipo -0500; strftime nos da el sufijo.
+    return dt.strftime("%Y-%m-%d %H:%M %z")
+
+
+def sort_key(item: tuple[datetime, HourBucket]) -> tuple[datetime, str]:
+    """Orden cronológico por instante absoluto; desempate estable por etiqueta."""
+    dt = item[0]
+    return (dt.astimezone(timezone.utc), format_hour_label(dt))
 
 
 def print_report(file_path: Path, agg: Aggregation) -> None:
@@ -220,12 +227,28 @@ def print_report(file_path: Path, agg: Aggregation) -> None:
 
     print()
     print("HTTP ERROR DISTRIBUTION")
-    # Orden numérico ascendente, independiente del orden de inserción.
     for code in sorted(agg.error_codes):
-        label = format_reason(code)
-        count = agg.error_codes[code]
-        print(f"{label}: {count:>6}")
+        print(f"{format_reason(code)}: {agg.error_codes[code]:>6}")
 
+    print()
+    print("HOURLY HTTP ERROR STATISTICS")
+    print("-" * 53)
+    print(f"{'DATE / HOUR':<28}{'4xx':>6}{'5xx':>6}{'TOTAL':>8}")
+    ordered = sorted(agg.hourly.items(), key=sort_key)
+    for dt, bucket in ordered:
+        print(
+            f"{format_hour_label(dt):<28}"
+            f"{bucket.client_errors:>6}"
+            f"{bucket.server_errors:>6}"
+            f"{bucket.total:>8}"
+        )
+    print("-" * 53)
+
+    # max() sobre lista ya ordenada cronológicamente -> primer máximo en empate.
+    peak_dt, peak_bucket = max(ordered, key=lambda kv: kv[1].total)
+    print(f"Peak error hour: {format_hour_label(peak_dt)}")
+    print(f"Peak error count: {peak_bucket.total}")
+    print("(ties resolved to the earliest interval)")
     print("--------------------------------")
     print("Analysis completed.")
 
@@ -235,7 +258,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         prog="log_summary.py",
         description=(
             "Parsea un access log de Nginx (combined), cuenta errores HTTP "
-            "4xx/5xx y muestra un resumen."
+            "4xx/5xx globales y por intervalo horario."
         ),
     )
     parser.add_argument(
