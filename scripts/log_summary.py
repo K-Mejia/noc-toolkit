@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Nginx access log parser (combined format) — NOC Toolkit.
+"""Nginx access log analyzer (combined format) — NOC Toolkit.
 
-Etapa DEV-004.1: solo lectura, parsing y validación de líneas.
-No se calculan estadísticas de códigos, métodos, IPs ni horas.
+Etapa DEV-004.2: parser + agregación de errores HTTP 4xx/5xx.
+No hay estadísticas horarias, exportaciones ni gráficos.
 """
 
 from __future__ import annotations
@@ -10,7 +10,8 @@ from __future__ import annotations
 import argparse
 import re
 import sys
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Iterator
@@ -19,18 +20,6 @@ EXIT_OK = 0
 EXIT_READ_ERROR = 1
 EXIT_USAGE = 2
 
-# Formato combined:
-# $remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent
-#   "$http_referer" "$http_user_agent"
-#
-# - remote_addr: IP o nombre (no validamos contenido aquí; validación de IP
-#   estricta no está en alcance de esta etapa).
-# - remote_user: '-' o usuario sin espacios.
-# - time_local: dentro de [...]; lo validamos con datetime después.
-# - request: "METODO RUTA PROTOCOLO"; sin espacios en cada token.
-# - status: 3 dígitos (rango 100-599 validado después).
-# - body_bytes_sent: dígitos o '-' (Nginx puede emitir '-' en logs truncados).
-# - referer, user-agent: entre comillas dobles, sin comillas internas.
 _PATTERN = re.compile(
     r'^(?P<remote_addr>\S+)'
     r' - '
@@ -44,8 +33,48 @@ _PATTERN = re.compile(
     r'\s*$'
 )
 
-# Formatos de fecha aceptados en Nginx (time_local).
 _DT_FORMAT = "%d/%b/%Y:%H:%M:%S %z"
+
+# Descripciones de códigos HTTP relevantes al reporte (4xx y 5xx).
+# Los códigos no listados se muestran como "HTTP <code> (unknown reason)".
+_HTTP_REASONS: dict[int, str] = {
+    400: "Bad Request",
+    401: "Unauthorized",
+    403: "Forbidden",
+    404: "Not Found",
+    405: "Method Not Allowed",
+    406: "Not Acceptable",
+    408: "Request Timeout",
+    409: "Conflict",
+    410: "Gone",
+    411: "Length Required",
+    412: "Precondition Failed",
+    413: "Payload Too Large",
+    414: "URI Too Long",
+    415: "Unsupported Media Type",
+    416: "Range Not Satisfiable",
+    417: "Expectation Failed",
+    418: "I'm a teapot",
+    421: "Misdirected Request",
+    422: "Unprocessable Entity",
+    425: "Too Early",
+    426: "Upgrade Required",
+    428: "Precondition Required",
+    429: "Too Many Requests",
+    431: "Request Header Fields Too Large",
+    451: "Unavailable For Legal Reasons",
+    500: "Internal Server Error",
+    501: "Not Implemented",
+    502: "Bad Gateway",
+    503: "Service Unavailable",
+    504: "Gateway Timeout",
+    505: "HTTP Version Not Supported",
+    506: "Variant Also Negotiates",
+    507: "Insufficient Storage",
+    508: "Loop Detected",
+    510: "Not Extended",
+    511: "Network Authentication Required",
+}
 
 
 @dataclass(frozen=True)
@@ -59,8 +88,24 @@ class LogRecord:
     bytes_sent: int
 
 
+@dataclass
+class Aggregation:
+    """Contadores agregados de un archivo de log."""
+
+    total_lines: int = 0
+    valid_records: int = 0
+    invalid_records: int = 0
+    non_error: int = 0
+    client_errors: int = 0
+    server_errors: int = 0
+    error_codes: Counter[int] = field(default_factory=Counter)
+
+    @property
+    def total_http_errors(self) -> int:
+        return self.client_errors + self.server_errors
+
+
 def parse_timestamp(raw: str) -> datetime | None:
-    """Devuelve datetime con tzinfo o None si el formato es inválido."""
     try:
         return datetime.strptime(raw, _DT_FORMAT)
     except ValueError:
@@ -68,10 +113,6 @@ def parse_timestamp(raw: str) -> datetime | None:
 
 
 def parse_line(line: str) -> LogRecord | None:
-    """Parsea una línea combined. Devuelve None si es inválida.
-
-    La línea puede venir con o sin salto final; se limpia antes de parsear.
-    """
     line = line.rstrip("\n")
     match = _PATTERN.match(line)
     if match is None:
@@ -87,9 +128,6 @@ def parse_line(line: str) -> LogRecord | None:
 
     raw_bytes = match.group("body_bytes_sent")
     if raw_bytes == "-":
-        # Nginx puede emitir '-' si el tamaño no está disponible.
-        # Lo tratamos como inválido en esta etapa para forzar revisión
-        # explícita en un incremento futuro. Ver limitaciones.
         return None
     bytes_sent = int(raw_bytes)
     if bytes_sent < 0:
@@ -113,46 +151,91 @@ def parse_line(line: str) -> LogRecord | None:
 
 
 def iter_file_lines(path: Path) -> Iterator[str]:
-    """Itera líneas en UTF-8. Propaga UnicodeDecodeError y OSError."""
     with path.open("r", encoding="utf-8") as fh:
         for line in fh:
             yield line
 
 
-def process_file(path: Path) -> tuple[int, int, int]:
-    """Devuelve (total_lines, valid_records, invalid_records)."""
-    total = 0
-    valid = 0
-    invalid = 0
+def classify_status(status: int) -> str:
+    """Devuelve 'non_error', 'client_error' o 'server_error'."""
+    if 400 <= status <= 499:
+        return "client_error"
+    if 500 <= status <= 599:
+        return "server_error"
+    return "non_error"
+
+
+def aggregate(path: Path) -> Aggregation:
+    """Recorre el archivo y construye la agregación sin acumular registros."""
+    agg = Aggregation()
     for line in iter_file_lines(path):
-        # Contar todas las líneas no vacías como registros intentados.
-        # Líneas vacías o solo espacios se cuentan como inválidas.
-        total += 1
-        if parse_line(line) is None:
-            invalid += 1
+        agg.total_lines += 1
+        record = parse_line(line)
+        if record is None:
+            agg.invalid_records += 1
+            continue
+
+        agg.valid_records += 1
+        category = classify_status(record.status)
+        if category == "client_error":
+            agg.client_errors += 1
+            agg.error_codes[record.status] += 1
+        elif category == "server_error":
+            agg.server_errors += 1
+            agg.error_codes[record.status] += 1
         else:
-            valid += 1
-    return total, valid, invalid
+            agg.non_error += 1
+    return agg
 
 
-def print_report(file_path: Path, total: int, valid: int, invalid: int) -> None:
-    print("NGINX LOG PARSER")
+def format_reason(code: int) -> str:
+    reason = _HTTP_REASONS.get(code)
+    if reason is None:
+        return f"HTTP {code} (unknown reason)"
+    return f"{code} {reason}"
+
+
+def print_report(file_path: Path, agg: Aggregation) -> None:
+    print("NGINX LOG ANALYZER")
     print("--------------------------------")
     print(f"File: {file_path}")
     print()
-    print(f"Total lines:     {total:>6}")
-    print(f"Valid records:   {valid:>6}")
-    print(f"Invalid records: {invalid:>6}")
+    print("PARSING SUMMARY")
+    print(f"Total lines:     {agg.total_lines:>6}")
+    print(f"Valid records:   {agg.valid_records:>6}")
+    print(f"Invalid records: {agg.invalid_records:>6}")
+    print()
+    print("HTTP ERROR SUMMARY")
+    print(f"Non-error responses:  {agg.non_error:>6}")
+    print(f"Client errors (4xx):  {agg.client_errors:>6}")
+    print(f"Server errors (5xx):  {agg.server_errors:>6}")
+    print(f"Total HTTP errors:    {agg.total_http_errors:>6}")
+
+    if agg.total_http_errors == 0:
+        print()
+        print("No HTTP errors were found.")
+        print("--------------------------------")
+        print("Analysis completed.")
+        return
+
+    print()
+    print("HTTP ERROR DISTRIBUTION")
+    # Orden numérico ascendente, independiente del orden de inserción.
+    for code in sorted(agg.error_codes):
+        label = format_reason(code)
+        count = agg.error_codes[code]
+        print(f"{label}: {count:>6}")
+
     print("--------------------------------")
-    print("Parsing completed.")
+    print("Analysis completed.")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="log_summary.py",
         description=(
-            "Parsea un access log de Nginx en formato combined y muestra "
-            "un resumen básico de registros válidos e inválidos."
+            "Parsea un access log de Nginx (combined), cuenta errores HTTP "
+            "4xx/5xx y muestra un resumen."
         ),
     )
     parser.add_argument(
@@ -166,10 +249,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
-    # argparse llama a sys.exit(2) si --file falta o es inválido,
-    # lo que respeta nuestro EXIT_USAGE=2.
     args = parser.parse_args(argv)
-
     file_path: Path = args.file
 
     if not file_path.exists():
@@ -180,7 +260,7 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_READ_ERROR
 
     try:
-        total, valid, invalid = process_file(file_path)
+        agg = aggregate(file_path)
     except PermissionError:
         print(f"ERROR: no se puede leer el archivo: {file_path}", file=sys.stderr)
         return EXIT_READ_ERROR
@@ -195,7 +275,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: fallo al leer el archivo: {exc}", file=sys.stderr)
         return EXIT_READ_ERROR
 
-    print_report(file_path, total, valid, invalid)
+    print_report(file_path, agg)
     return EXIT_OK
 
 
